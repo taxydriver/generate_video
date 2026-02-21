@@ -12,6 +12,13 @@ RUN git clone https://github.com/comfyanonymous/ComfyUI.git && \
     cd /ComfyUI && \
     pip install -r requirements.txt
 
+# Override Frame Interpolation node (fix broken RIFE download URL)
+RUN rm -rf /ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation && \
+    cd /ComfyUI/custom_nodes && \
+    git clone https://github.com/<YOUR_GITHUB_USER>/ComfyUI-Frame-Interpolation.git && \
+    cd ComfyUI-Frame-Interpolation && \
+    pip install -r requirements.txt || true
+
 RUN cd /ComfyUI/custom_nodes && \
     git clone https://github.com/Comfy-Org/ComfyUI-Manager.git && \
     cd ComfyUI-Manager && \
