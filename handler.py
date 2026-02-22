@@ -191,6 +191,23 @@ def get_videos(ws, prompt):
     if not any(output_videos.values()):
         logger.error(f"No video outputs found. Available output nodes: {list(history.get('outputs', {}).keys())}")
         logger.error(f"Full history: {json.dumps(history, indent=2)}")
+        status = history.get("status", {})
+        messages = status.get("messages", [])
+        for message in messages:
+            if (
+                isinstance(message, list)
+                and len(message) >= 2
+                and message[0] == "execution_error"
+                and isinstance(message[1], dict)
+            ):
+                error_payload = message[1]
+                exception_type = error_payload.get("exception_type") or "ExecutionError"
+                node_type = error_payload.get("node_type") or "unknown_node"
+                node_id = error_payload.get("node_id") or "unknown"
+                exception_message = (error_payload.get("exception_message") or "No details").strip().replace("\n", " ")
+                raise RuntimeError(
+                    f"{exception_type} at {node_type}({node_id}): {exception_message}"
+                )
 
     return output_videos
 
@@ -198,31 +215,41 @@ def load_workflow(workflow_path):
     with open(workflow_path, 'r') as file:
         return json.load(file)
 
-def apply_safe_attention_mode(prompt):
+def apply_safe_attention_mode(prompt, requested_mode=None):
     """
     Guardrail: force non-Sage attention at runtime to avoid incompatible CUDA kernels
     on some RunPod GPU images.
     """
-    requested_mode = os.getenv("ATTENTION_MODE_OVERRIDE", "sdpa").strip().lower()
-    safe_mode = "sdpa" if requested_mode in ("", "sageattn") else requested_mode
-    changed_nodes = []
+    mode = (
+        str(requested_mode).strip().lower()
+        if requested_mode is not None
+        else os.getenv("ATTENTION_MODE_OVERRIDE", "sdpa").strip().lower()
+    )
+    safe_mode = "sdpa" if mode in ("", "sageattn", "auto") else mode
+    changed_paths = []
 
-    for node_id, node in prompt.items():
-        if not isinstance(node, dict):
-            continue
-        inputs = node.get("inputs")
-        if not isinstance(inputs, dict):
-            continue
-        attention_mode = inputs.get("attention_mode")
-        if isinstance(attention_mode, str) and attention_mode.strip().lower() == "sageattn":
-            inputs["attention_mode"] = safe_mode
-            changed_nodes.append(node_id)
+    def _rewrite(obj, path):
+        if isinstance(obj, dict):
+            for key, value in list(obj.items()):
+                next_path = f"{path}.{key}" if path else str(key)
+                if isinstance(value, str) and value.strip().lower() == "sageattn":
+                    obj[key] = safe_mode
+                    changed_paths.append(next_path)
+                else:
+                    _rewrite(value, next_path)
+        elif isinstance(obj, list):
+            for idx, value in enumerate(obj):
+                _rewrite(value, f"{path}[{idx}]")
 
-    if changed_nodes:
+    _rewrite(prompt, "")
+
+    if changed_paths:
         logger.warning(
-            f"Replaced attention_mode=sageattn with {safe_mode} "
-            f"for nodes: {', '.join(changed_nodes)}"
+            f"Replaced {len(changed_paths)} sageattn value(s) with {safe_mode}: "
+            f"{', '.join(changed_paths[:10])}"
         )
+    else:
+        logger.info(f"No sageattn values found in prompt; attention mode remains {safe_mode}")
 
 def handler(job):
         try:
@@ -267,7 +294,7 @@ def handler(job):
             logger.info(f"Using {'FLF2V' if end_image_path_local else 'single'} workflow with {lora_count} LoRA pairs")
 
             prompt = load_workflow(workflow_file)
-            apply_safe_attention_mode(prompt)
+            apply_safe_attention_mode(prompt, job_input.get("attention_mode_override"))
 
             length = job_input.get("length", 81)
             steps = job_input.get("steps", 10)

@@ -3,6 +3,9 @@
 # Exit immediately if a command exits with a non-zero status.
 set -e
 
+# Force-safe attention mode unless explicitly overridden.
+export ATTENTION_MODE_OVERRIDE="${ATTENTION_MODE_OVERRIDE:-sdpa}"
+
 # Start ComfyUI in the background
 echo "Starting ComfyUI in the background..."
 python /ComfyUI/main.py --listen &
