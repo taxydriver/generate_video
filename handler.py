@@ -137,6 +137,23 @@ def get_videos(ws, prompt):
                         with open(fullpath, 'rb') as f:
                             video_data = base64.b64encode(f.read()).decode('utf-8')
                         videos_output.append(video_data)
+                        continue
+
+                    # Fallback for outputs that provide filename/subfolder/type only.
+                    filename = item.get("filename")
+                    if filename:
+                        subfolder = item.get("subfolder", "")
+                        folder_type = item.get("type", "output")
+                        try:
+                            video_bytes = get_image(filename, subfolder, folder_type)
+                            if video_bytes:
+                                video_data = base64.b64encode(video_bytes).decode('utf-8')
+                                videos_output.append(video_data)
+                        except Exception as e:
+                            logger.warning(
+                                f"Failed to fetch output via /view "
+                                f"(filename={filename}, subfolder={subfolder}, type={folder_type}): {e}"
+                            )
 
         output_videos[node_id] = videos_output
 
