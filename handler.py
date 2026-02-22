@@ -116,16 +116,47 @@ def get_videos(ws, prompt):
     prompt_id = queue_prompt(prompt)['prompt_id']
     output_videos = {}
 
-    while True:
-        out = ws.recv()
-        if isinstance(out, str):
-            message = json.loads(out)
-            if message['type'] == 'executing':
-                data = message['data']
-                if data['node'] is None and data['prompt_id'] == prompt_id:
+    # Prefer WS completion signal, but tolerate WS drops by falling back to history polling.
+    ws_failed = False
+    try:
+        while True:
+            out = ws.recv()
+            if isinstance(out, str):
+                message = json.loads(out)
+                if message['type'] == 'executing':
+                    data = message['data']
+                    if data['node'] is None and data['prompt_id'] == prompt_id:
+                        break
+    except Exception as e:
+        ws_failed = True
+        logger.warning(f"WebSocket receive failed; falling back to history polling: {e}")
+
+    poll_timeout_s = int(os.getenv("HISTORY_POLL_TIMEOUT_S", "180"))
+    poll_interval_s = float(os.getenv("HISTORY_POLL_INTERVAL_S", "2"))
+    deadline = time.time() + poll_timeout_s
+    history = None
+
+    while time.time() < deadline:
+        try:
+            history_payload = get_history(prompt_id)
+            history = history_payload.get(prompt_id)
+
+            if history is not None:
+                outputs = history.get('outputs', {})
+                if outputs:
                     break
 
-    history = get_history(prompt_id)[prompt_id]
+        except Exception as e:
+            logger.warning(f"History poll failed (prompt_id={prompt_id}): {e}")
+
+        # If WS worked and we still do not see outputs yet, keep polling briefly for consistency.
+        if not ws_failed and history is not None and history.get('outputs'):
+            break
+        time.sleep(poll_interval_s)
+
+    if history is None:
+        raise RuntimeError(f"Prompt history missing for prompt_id={prompt_id}")
+
     for node_id, node_output in history.get('outputs', {}).items():
         videos_output = []
 
@@ -320,7 +351,13 @@ def handler(job):
             ws.close()
 
             # 이미지가 없는 경우 처리
+            preferred_node_videos = videos.get("131") or []
+            if preferred_node_videos:
+                return {"video": preferred_node_videos[0]}
+
             for node_id in videos:
+                if node_id == "131":
+                    continue
                 if videos[node_id]:
                     return {"video": videos[node_id][0]}
 
