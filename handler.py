@@ -198,6 +198,32 @@ def load_workflow(workflow_path):
     with open(workflow_path, 'r') as file:
         return json.load(file)
 
+def apply_safe_attention_mode(prompt):
+    """
+    Guardrail: force non-Sage attention at runtime to avoid incompatible CUDA kernels
+    on some RunPod GPU images.
+    """
+    requested_mode = os.getenv("ATTENTION_MODE_OVERRIDE", "sdpa").strip().lower()
+    safe_mode = "sdpa" if requested_mode in ("", "sageattn") else requested_mode
+    changed_nodes = []
+
+    for node_id, node in prompt.items():
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict):
+            continue
+        attention_mode = inputs.get("attention_mode")
+        if isinstance(attention_mode, str) and attention_mode.strip().lower() == "sageattn":
+            inputs["attention_mode"] = safe_mode
+            changed_nodes.append(node_id)
+
+    if changed_nodes:
+        logger.warning(
+            f"Replaced attention_mode=sageattn with {safe_mode} "
+            f"for nodes: {', '.join(changed_nodes)}"
+        )
+
 def handler(job):
         try:
             job_input = job.get("input", {})
@@ -241,6 +267,7 @@ def handler(job):
             logger.info(f"Using {'FLF2V' if end_image_path_local else 'single'} workflow with {lora_count} LoRA pairs")
 
             prompt = load_workflow(workflow_file)
+            apply_safe_attention_mode(prompt)
 
             length = job_input.get("length", 81)
             steps = job_input.get("steps", 10)

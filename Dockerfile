@@ -40,11 +40,6 @@ RUN cd /ComfyUI/custom_nodes && \
     pip install -r requirements.txt
     
 RUN cd /ComfyUI/custom_nodes && \
-    git clone https://github.com/kael558/ComfyUI-GGUF-FantasyTalking && \
-    cd ComfyUI-GGUF-FantasyTalking && \
-    pip install -r requirements.txt
-    
-RUN cd /ComfyUI/custom_nodes && \
     git clone https://github.com/orssorbit/ComfyUI-wanBlockswap
 
 RUN cd /ComfyUI/custom_nodes && \
