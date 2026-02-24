@@ -18,6 +18,30 @@ logger = logging.getLogger(__name__)
 
 server_address = os.getenv('SERVER_ADDRESS', '127.0.0.1')
 client_id = str(uuid.uuid4())
+COMFY_HTTP_READY = False
+
+# Speed-oriented defaults/caps (override via environment if needed).
+DEFAULT_LENGTH = int(os.getenv("DEFAULT_LENGTH", "65"))
+DEFAULT_STEPS = int(os.getenv("DEFAULT_STEPS", "8"))
+DEFAULT_CONTEXT_FRAMES = int(os.getenv("DEFAULT_CONTEXT_FRAMES", "49"))
+DEFAULT_CONTEXT_OVERLAP = int(os.getenv("DEFAULT_CONTEXT_OVERLAP", "16"))
+MAX_LENGTH = int(os.getenv("MAX_LENGTH", "65"))
+MAX_STEPS = int(os.getenv("MAX_STEPS", "8"))
+MAX_CONTEXT_OVERLAP = int(os.getenv("MAX_CONTEXT_OVERLAP", "24"))
+ENFORCE_SPEED_LIMITS = os.getenv("ENFORCE_SPEED_LIMITS", "1").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _safe_int(value, default):
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
+
+
+def _clamp(value, low, high):
+    return max(low, min(value, high))
+
+
 def to_nearest_multiple_of_16(value):
     """주어진 값을 가장 가까운 16의 배수로 보정, 최소 16 보장"""
     try:
@@ -112,9 +136,44 @@ def get_history(prompt_id):
     with urllib.request.urlopen(url) as response:
         return json.loads(response.read())
 
-def get_videos(ws, prompt):
+def _extract_first_video_base64(history, preferred_node_ids=("131",)):
+    outputs = history.get("outputs", {}) if isinstance(history, dict) else {}
+
+    ordered_node_ids = []
+    for node_id in preferred_node_ids:
+        if node_id in outputs:
+            ordered_node_ids.append(node_id)
+    for node_id in outputs.keys():
+        if node_id not in ordered_node_ids:
+            ordered_node_ids.append(node_id)
+
+    for node_id in ordered_node_ids:
+        node_output = outputs.get(node_id) or {}
+        for key in ("gifs", "videos", "files"):
+            for item in node_output.get(key, []) or []:
+                fullpath = item.get("fullpath")
+                if fullpath and os.path.exists(fullpath):
+                    with open(fullpath, "rb") as f:
+                        return base64.b64encode(f.read()).decode("utf-8")
+
+                filename = item.get("filename")
+                if filename:
+                    subfolder = item.get("subfolder", "")
+                    folder_type = item.get("type", "output")
+                    try:
+                        video_bytes = get_image(filename, subfolder, folder_type)
+                        if video_bytes:
+                            return base64.b64encode(video_bytes).decode("utf-8")
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to fetch output via /view "
+                            f"(filename={filename}, subfolder={subfolder}, type={folder_type}): {e}"
+                        )
+    return None
+
+
+def get_video_base64(ws, prompt):
     prompt_id = queue_prompt(prompt)['prompt_id']
-    output_videos = {}
 
     # Prefer WS completion signal, but tolerate WS drops by falling back to history polling.
     ws_failed = False
@@ -157,59 +216,31 @@ def get_videos(ws, prompt):
     if history is None:
         raise RuntimeError(f"Prompt history missing for prompt_id={prompt_id}")
 
-    for node_id, node_output in history.get('outputs', {}).items():
-        videos_output = []
+    first_video = _extract_first_video_base64(history)
+    if first_video:
+        return first_video
 
-        for key in ("gifs", "videos", "files"):
-            if key in node_output:
-                for item in node_output[key]:
-                    fullpath = item.get("fullpath")
-                    if fullpath and os.path.exists(fullpath):
-                        with open(fullpath, 'rb') as f:
-                            video_data = base64.b64encode(f.read()).decode('utf-8')
-                        videos_output.append(video_data)
-                        continue
+    logger.error(f"No video outputs found. Available output nodes: {list(history.get('outputs', {}).keys())}")
+    logger.error(f"Full history: {json.dumps(history, indent=2)}")
+    status = history.get("status", {})
+    messages = status.get("messages", [])
+    for message in messages:
+        if (
+            isinstance(message, list)
+            and len(message) >= 2
+            and message[0] == "execution_error"
+            and isinstance(message[1], dict)
+        ):
+            error_payload = message[1]
+            exception_type = error_payload.get("exception_type") or "ExecutionError"
+            node_type = error_payload.get("node_type") or "unknown_node"
+            node_id = error_payload.get("node_id") or "unknown"
+            exception_message = (error_payload.get("exception_message") or "No details").strip().replace("\n", " ")
+            raise RuntimeError(
+                f"{exception_type} at {node_type}({node_id}): {exception_message}"
+            )
 
-                    # Fallback for outputs that provide filename/subfolder/type only.
-                    filename = item.get("filename")
-                    if filename:
-                        subfolder = item.get("subfolder", "")
-                        folder_type = item.get("type", "output")
-                        try:
-                            video_bytes = get_image(filename, subfolder, folder_type)
-                            if video_bytes:
-                                video_data = base64.b64encode(video_bytes).decode('utf-8')
-                                videos_output.append(video_data)
-                        except Exception as e:
-                            logger.warning(
-                                f"Failed to fetch output via /view "
-                                f"(filename={filename}, subfolder={subfolder}, type={folder_type}): {e}"
-                            )
-
-        output_videos[node_id] = videos_output
-
-    if not any(output_videos.values()):
-        logger.error(f"No video outputs found. Available output nodes: {list(history.get('outputs', {}).keys())}")
-        logger.error(f"Full history: {json.dumps(history, indent=2)}")
-        status = history.get("status", {})
-        messages = status.get("messages", [])
-        for message in messages:
-            if (
-                isinstance(message, list)
-                and len(message) >= 2
-                and message[0] == "execution_error"
-                and isinstance(message[1], dict)
-            ):
-                error_payload = message[1]
-                exception_type = error_payload.get("exception_type") or "ExecutionError"
-                node_type = error_payload.get("node_type") or "unknown_node"
-                node_id = error_payload.get("node_id") or "unknown"
-                exception_message = (error_payload.get("exception_message") or "No details").strip().replace("\n", " ")
-                raise RuntimeError(
-                    f"{exception_type} at {node_type}({node_id}): {exception_message}"
-                )
-
-    return output_videos
+    raise RuntimeError("No video outputs produced")
 
 def load_workflow(workflow_path):
     with open(workflow_path, 'r') as file:
@@ -253,6 +284,7 @@ def apply_safe_attention_mode(prompt, requested_mode=None):
 
 def handler(job):
         try:
+            global COMFY_HTTP_READY
             job_input = job.get("input", {})
 
             logger.info(f"Received job input: {job_input}")
@@ -296,8 +328,36 @@ def handler(job):
             prompt = load_workflow(workflow_file)
             apply_safe_attention_mode(prompt, job_input.get("attention_mode_override"))
 
-            length = job_input.get("length", 81)
-            steps = job_input.get("steps", 10)
+            requested_length = _safe_int(job_input.get("length", DEFAULT_LENGTH), DEFAULT_LENGTH)
+            requested_steps = _safe_int(job_input.get("steps", DEFAULT_STEPS), DEFAULT_STEPS)
+            requested_context_frames = _safe_int(
+                job_input.get("context_frames", min(requested_length, DEFAULT_CONTEXT_FRAMES)),
+                min(requested_length, DEFAULT_CONTEXT_FRAMES),
+            )
+            requested_context_overlap = _safe_int(
+                job_input.get("context_overlap", DEFAULT_CONTEXT_OVERLAP),
+                DEFAULT_CONTEXT_OVERLAP,
+            )
+
+            if ENFORCE_SPEED_LIMITS:
+                length = _clamp(requested_length, 16, MAX_LENGTH)
+                steps = _clamp(requested_steps, 1, MAX_STEPS)
+            else:
+                length = max(16, requested_length)
+                steps = max(1, requested_steps)
+
+            context_frames = _clamp(requested_context_frames, 1, length)
+            context_overlap_cap = min(MAX_CONTEXT_OVERLAP, max(0, context_frames - 1))
+            context_overlap = _clamp(requested_context_overlap, 0, context_overlap_cap)
+
+            if length != requested_length:
+                logger.info(f"Length capped for speed: {requested_length} -> {length}")
+            if steps != requested_steps:
+                logger.info(f"Steps capped for speed: {requested_steps} -> {steps}")
+            if context_overlap != requested_context_overlap:
+                logger.info(
+                    f"Context overlap adjusted: {requested_context_overlap} -> {context_overlap}"
+                )
 
             seed = job_input.get("seed", 42)
             cfg = float(job_input.get("cfg", 2.0))
@@ -324,14 +384,14 @@ def handler(job):
                 logger.info(f"Height adjusted to nearest multiple of 16: {original_height} -> {adjusted_height}")
             prompt["235"]["inputs"]["value"] = adjusted_width
             prompt["236"]["inputs"]["value"] = adjusted_height
-            prompt["498"]["inputs"]["context_overlap"] = job_input.get("context_overlap", 48)
-            prompt["498"]["inputs"]["context_frames"] = length
+            prompt["498"]["inputs"]["context_overlap"] = context_overlap
+            prompt["498"]["inputs"]["context_frames"] = context_frames
 
             # step 설정 적용
             if "834" in prompt:
                 prompt["834"]["inputs"]["steps"] = steps
                 logger.info(f"Steps set to: {steps}")
-                lowsteps = int(steps*0.6)
+                lowsteps = max(1, int(round(steps * 0.6)))
                 prompt["829"]["inputs"]["step"] = lowsteps
                 logger.info(f"LowSteps set to: {lowsteps}")
 
@@ -370,27 +430,30 @@ def handler(job):
             ws_url = f"ws://{server_address}:8188/ws?clientId={client_id}"
             logger.info(f"Connecting to WebSocket: {ws_url}")
 
-            # 먼저 HTTP 연결이 가능한지 확인
-            http_url = f"http://{server_address}:8188/"
-            logger.info(f"Checking HTTP connection to: {http_url}")
-
-            # HTTP 연결 확인 (최대 1분)
-            max_http_attempts = 180
-            for http_attempt in range(max_http_attempts):
-                try:
-                    import urllib.request
-                    response = urllib.request.urlopen(http_url, timeout=5)
-                    logger.info(f"HTTP 연결 성공 (시도 {http_attempt+1})")
-                    break
-                except Exception as e:
-                    logger.warning(f"HTTP 연결 실패 (시도 {http_attempt+1}/{max_http_attempts}): {e}")
-                    if http_attempt == max_http_attempts - 1:
-                        raise Exception("ComfyUI 서버에 연결할 수 없습니다. 서버가 실행 중인지 확인하세요.")
-                    time.sleep(1)
+            # HTTP readiness check once per worker process.
+            if not COMFY_HTTP_READY:
+                http_url = f"http://{server_address}:8188/"
+                logger.info(f"Checking HTTP connection to: {http_url}")
+                max_http_attempts = int(os.getenv("HTTP_CONNECT_MAX_ATTEMPTS", "60"))
+                http_retry_sleep_s = float(os.getenv("HTTP_CONNECT_RETRY_S", "1"))
+                for http_attempt in range(max_http_attempts):
+                    try:
+                        urllib.request.urlopen(http_url, timeout=5)
+                        logger.info(f"HTTP 연결 성공 (시도 {http_attempt+1})")
+                        COMFY_HTTP_READY = True
+                        break
+                    except Exception as e:
+                        logger.warning(
+                            f"HTTP 연결 실패 (시도 {http_attempt+1}/{max_http_attempts}): {e}"
+                        )
+                        if http_attempt == max_http_attempts - 1:
+                            raise Exception("ComfyUI 서버에 연결할 수 없습니다. 서버가 실행 중인지 확인하세요.")
+                        time.sleep(http_retry_sleep_s)
 
             ws = websocket.WebSocket()
-            # 웹소켓 연결 시도 (최대 3분)
-            max_attempts = int(180/5)  # 3분 (1초에 한 번씩 시도)
+            # 웹소켓 연결 시도
+            ws_retry_sleep_s = float(os.getenv("WS_CONNECT_RETRY_S", "2"))
+            max_attempts = int(os.getenv("WS_CONNECT_MAX_ATTEMPTS", "60"))
             for attempt in range(max_attempts):
                 try:
                     ws.connect(ws_url)
@@ -399,23 +462,11 @@ def handler(job):
                 except Exception as e:
                     logger.warning(f"웹소켓 연결 실패 (시도 {attempt+1}/{max_attempts}): {e}")
                     if attempt == max_attempts - 1:
-                        raise Exception("웹소켓 연결 시간 초과 (3분)")
-                    time.sleep(5)
-            videos = get_videos(ws, prompt)
+                        raise Exception("웹소켓 연결 시간 초과")
+                    time.sleep(ws_retry_sleep_s)
+            video_data = get_video_base64(ws, prompt)
             ws.close()
-
-            # 이미지가 없는 경우 처리
-            preferred_node_videos = videos.get("131") or []
-            if preferred_node_videos:
-                return {"video": preferred_node_videos[0]}
-
-            for node_id in videos:
-                if node_id == "131":
-                    continue
-                if videos[node_id]:
-                    return {"video": videos[node_id][0]}
-
-            return {"error": "비디오를 찾을 수 없습니다."}
+            return {"video": video_data}
         except Exception as e:
             logger.exception("Handler crashed")
             return {"error": f"{type(e).__name__}: {str(e)}"}

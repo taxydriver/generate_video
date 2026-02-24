@@ -19,10 +19,10 @@ RUN rm -rf /ComfyUI/custom_nodes/ComfyUI-Frame-Interpolation && \
     cd ComfyUI-Frame-Interpolation && \
     pip install -r requirements.txt || true
 
-RUN cd /ComfyUI/custom_nodes && \
-    git clone https://github.com/Comfy-Org/ComfyUI-Manager.git && \
-    cd ComfyUI-Manager && \
-    pip install -r requirements.txt
+# NOTE:
+# ComfyUI-Manager is intentionally excluded in production worker images.
+# It performs background registry sync tasks that add startup/runtime overhead
+# but is not required for inference execution.
     
 RUN cd /ComfyUI/custom_nodes && \
     git clone https://github.com/city96/ComfyUI-GGUF && \
